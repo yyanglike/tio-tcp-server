@@ -1,0 +1,207 @@
+package com.example.tio;
+
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.*;
+import java.util.List;
+import java.util.Arrays;
+import java.util.Properties;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import io.etcd.jetcd.ByteSequence;
+import io.etcd.jetcd.Client;
+import io.etcd.jetcd.KV;
+import io.etcd.jetcd.Watch;
+import io.etcd.jetcd.lock.LockResponse;
+import io.etcd.jetcd.options.WatchOption;
+import io.etcd.jetcd.maintenance.StatusResponse;
+
+import io.etcd.jetcd.Maintenance;
+
+public class EtcdClusterService {
+    private static final String MASTER_KEY = "/master";
+    private static String nodeId;
+    private static List<String> etcdNodes;
+    private static Client etcdClient;
+    private static String currentMaster = "";
+    private static final AtomicBoolean isMaster = new AtomicBoolean(false);
+    private static int retryMaxAttempts;
+    private static int retryInitialDelay;
+    private static ScheduledExecutorService heartbeatExecutor;
+
+    public static void main(String[] args) throws Exception {
+        loadConfig();
+        setupEtcdClient();
+
+        if (tryAcquireMasterLock()) {
+            isMaster.set(true);
+            startHeartbeat();
+            System.out.println(nodeId + " is now the master.");
+        } else {
+            isMaster.set(false);
+            watchMasterKey();
+            System.out.println(nodeId + " is not the master.");
+        }
+
+        // Watch etcd for cluster nodes and health
+        watchClusterNodes();
+
+        // Keep application running
+        while (true) {
+            Thread.sleep(10000);
+        }
+    }
+
+    // private static void loadConfig() throws IOException {
+    //     Properties config = new Properties();
+    //     try (FileInputStream input = new FileInputStream("config.properties")) {
+    //         config.load(input);
+    //         String nodes = config.getProperty("etcd.nodes");
+    //         nodeId = config.getProperty("node.id");
+    //         etcdNodes = Arrays.asList(nodes.split(","));
+    //         retryMaxAttempts = Integer.parseInt(config.getProperty("retry.max_attempts"));
+    //         retryInitialDelay = Integer.parseInt(config.getProperty("retry.initial_delay"));
+    //     }
+    // }
+
+    public static void loadConfig() {
+        // Using getClassLoader().getResourceAsStream() to load the file from resources
+        try (InputStream input = EtcdClusterService.class.getClassLoader().getResourceAsStream("config.properties")) {
+            if (input == null) {
+                System.out.println("Sorry, unable to find config.properties");
+                return;
+            }
+
+            // Load the properties from the input stream
+            Properties properties = new Properties();
+            properties.load(input);
+
+            String nodes = properties.getProperty("etcd.nodes");
+            nodeId = properties.getProperty("node.id");
+            etcdNodes = Arrays.asList(nodes.split(","));
+            retryMaxAttempts = Integer.parseInt(properties.getProperty("retry.max_attempts"));
+            retryInitialDelay = Integer.parseInt(properties.getProperty("retry.initial_delay"));
+
+        } catch (IOException ex) {
+            ex.printStackTrace();
+        }
+    }
+
+    private static void setupEtcdClient() {
+        // Check if TLS is enabled
+        // boolean isTlsEnabled = Boolean.parseBoolean(System.getProperty("etcd.tls.enabled", "false"));
+        // if (isTlsEnabled) {
+        //     String certFile = System.getProperty("etcd.tls.certFile");
+        //     String keyFile = System.getProperty("etcd.tls.keyFile");
+        //     String caFile = System.getProperty("etcd.tls.caFile");
+        //     etcdClient = Client.builder()
+        //             .endpoints(etcdNodes.toArray(new String[0]))
+        //             // .tls(certFile, keyFile, caFile)
+        //             .build();
+        // } else 
+        {
+            etcdClient = Client.builder()
+                    .endpoints(etcdNodes.toArray(new String[0]))
+                    .build();
+        }
+        etcdClient.getLeaseClient();
+    }
+
+    private static boolean tryAcquireMasterLock() throws Exception {
+        int attempts = 0;
+        while (attempts < retryMaxAttempts) {
+            try {
+                KV kvClient = etcdClient.getKVClient();
+                // 直接获取锁响应对象
+                LockResponse lockResponse = etcdClient.getLockClient()
+                        .lock(ByteSequence.from(MASTER_KEY, StandardCharsets.UTF_8), 0).get();
+    
+                // 获取锁的键值
+                if (lockResponse != null) {
+                    currentMaster = lockResponse.getKey().toString(StandardCharsets.UTF_8);
+                    return true;
+                }
+            } catch (Exception e) {
+                System.out.println("Failed to acquire master lock. Retrying...");
+                attempts++;
+                Thread.sleep(retryInitialDelay * (long) Math.pow(2, attempts)); // Exponential backoff
+            }
+        }
+        return false;
+    }
+    private static void startHeartbeat() {
+        heartbeatExecutor = Executors.newSingleThreadScheduledExecutor();
+        heartbeatExecutor.scheduleAtFixedRate(() -> {
+            try {
+                KV kvClient = etcdClient.getKVClient();
+                kvClient.put(ByteSequence.from(MASTER_KEY, StandardCharsets.UTF_8), ByteSequence.from(nodeId, StandardCharsets.UTF_8)).get();
+                System.out.println(nodeId + " heartbeat sent to etcd.");
+            } catch (Exception e) {
+                System.out.println("Failed to send heartbeat: " + e.getMessage());
+            }
+        }, 0, 5, TimeUnit.SECONDS);
+    }
+
+    private static void watchMasterKey() {
+        Watch.Watcher watcher = etcdClient.getWatchClient().watch(ByteSequence.from(MASTER_KEY, StandardCharsets.UTF_8), WatchOption.newBuilder().withRevision(0).build(), watchResponse -> {
+            if (!watchResponse.getEvents().isEmpty()) {
+                String masterNode = watchResponse.getEvents().get(0).getKeyValue().getValue().toString(StandardCharsets.UTF_8);
+                if (!masterNode.equals(currentMaster)) {
+                    currentMaster = masterNode;
+                    System.out.println("New master elected: " + masterNode);
+                    if (masterNode.equals(nodeId)) {
+                        isMaster.set(true);
+                    } else {
+                        isMaster.set(false);
+                    }
+                }
+            }
+        });
+    }
+
+    private static void watchClusterNodes() {
+        // Watch for changes in cluster nodes and health
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
+            try {
+                // Get Maintenance client from etcd client
+                Maintenance maintenanceClient = etcdClient.getMaintenanceClient();
+                
+                // Use statusMember to get the health status of a specific member
+                // String targetMember = "localhost:2379";  // Use the actual member endpoint here
+                String targetMember = etcdNodes.get(0);
+                StatusResponse status = maintenanceClient.statusMember(targetMember).get();
+
+                System.out.println("Cluster health status: " + status);
+
+            } catch (Exception e) {
+                System.out.println("Failed to check etcd cluster health: " + e.getMessage());
+            }
+        }, 0, 10, TimeUnit.MINUTES);
+    }
+
+    private static void checkEtcdClusterHealth() {
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
+            try {
+                // Get Maintenance client from etcd client
+                Maintenance maintenanceClient = etcdClient.getMaintenanceClient();
+                
+                // Use statusMember to get the health status of a specific member
+                // String targetMember = "localhost:2379";  // Use the actual member endpoint here
+                String targetMember = etcdNodes.get(0);
+                StatusResponse status = maintenanceClient.statusMember(targetMember).get();
+
+                // Check the status of the member
+                if (status.getVersion().equals("")) {
+                    System.out.println("Etcd cluster is unhealthy.");
+                    // Handle necessary failover or other actions
+                } else {
+                    System.out.println("Etcd cluster is healthy. Version: " + status.getVersion());
+                }
+            } catch (Exception e) {
+                System.out.println("Failed to check etcd cluster health: " + e.getMessage());
+            }
+        }, 0, 10, TimeUnit.MINUTES);
+    }
+
+}

@@ -1,0 +1,195 @@
+package com.example.util;
+
+import net.openhft.chronicle.map.ChronicleMap;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public class OptimizedSharedDataStore {
+
+    // Logger to log errors
+    private static final Logger logger = Logger.getLogger(OptimizedSharedDataStore.class.getName());
+
+    // 单例模式
+    private static final OptimizedSharedDataStore INSTANCE = new OptimizedSharedDataStore();
+
+    private final ConcurrentHashMap<String, ChronicleMap<?, ?>> mapCache = new ConcurrentHashMap<>();
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+
+    private OptimizedSharedDataStore() {
+    }
+
+    public static OptimizedSharedDataStore getInstance() {
+        return INSTANCE;
+    }
+
+    /**
+     * 配置 ChronicleMap 的参数
+     */
+    public static class MapConfig {
+        private long entries = 1000;
+        private int averageValueSize = 100;
+
+        public MapConfig setEntries(long entries) {
+            this.entries = entries;
+            return this;
+        }
+
+        public MapConfig setAverageValueSize(int averageValueSize) {
+            this.averageValueSize = averageValueSize;
+            return this;
+        }
+
+        public long getEntries() {
+            return entries;
+        }
+
+        public int getAverageValueSize() {
+            return averageValueSize;
+        }
+    }
+
+    /**
+     * 获取或创建 ChronicleMap
+     */
+    private <K, V> ChronicleMap<K, V> createOrRecoverMap(
+            String mapName, File file, MapConfig config, Class<K> keyClass, Class<V> valueClass) throws IOException {
+        if (file.exists()) {
+            // 如果文件已存在，尝试恢复
+            try {
+                return ChronicleMap
+                        .of(keyClass, valueClass)
+                        .name(mapName)
+                        .entries(config.getEntries())
+                        .averageKeySize(30)
+                        .averageValueSize(config.getAverageValueSize())
+                        .recoverPersistedTo(file, false);
+            } catch (IOException e) {
+                logger.log(Level.SEVERE, "Failed to recover ChronicleMap from file: " + file.getAbsolutePath(), e);
+                throw e;
+            }
+        } else {
+            // 如果文件不存在，创建新的持久化文件
+            try {
+                return ChronicleMap
+                        .of(keyClass, valueClass)
+                        .name(mapName)
+                        .entries(config.getEntries())
+                        .averageKeySize(30)
+                        .averageValueSize(config.getAverageValueSize())
+                        .createPersistedTo(file);
+            } catch (IOException e) {
+                logger.log(Level.SEVERE, "Failed to create ChronicleMap at file: " + file.getAbsolutePath(), e);
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * 获取或创建普通的 Map
+     */
+    @SuppressWarnings("unchecked")
+    public ChronicleMap<String, String> getMap(String mapName, MapConfig config) throws IOException {
+        return (ChronicleMap<String, String>) mapCache.computeIfAbsent(mapName, name -> {
+            try {
+                File mapFile = new File(name + ".dat");
+                return createOrRecoverMap(name, mapFile, config, String.class, String.class);
+            } catch (IOException e) {
+                logger.log(Level.SEVERE, "Failed to create or recover ChronicleMap for " + name, e);
+                throw new RuntimeException("Failed to create ChronicleMap for " + name, e);
+            }
+        });
+    }
+
+    /**
+     * 获取或创建 Multimap
+     */
+    @SuppressWarnings("unchecked")
+    public ChronicleMap<String, Set<String>> getMultimap(String mapName, MapConfig config) throws IOException {
+        lock.readLock().lock();
+        try {
+            return (ChronicleMap<String, Set<String>>) mapCache.computeIfAbsent(mapName, name -> {
+                try {
+                    File mapFile = new File(name + "_multimap.dat");
+                    return ChronicleMap
+                            .of(String.class, (Class<Set<String>>) (Class<?>) Set.class)
+                            .name(name)
+                            .entries(config.getEntries())
+                            .averageKeySize(30)  // Configuring example key size
+                            .averageValueSize(config.getAverageValueSize())  // Configuring value size
+                            .createPersistedTo(mapFile);
+                } catch (IOException e) {
+                    logger.log(Level.SEVERE, "Failed to create ChronicleMap for Multimap " + name, e);
+                    throw new RuntimeException("Failed to create ChronicleMap for Multimap " + name, e);
+                }
+            });
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * 添加数据到普通的 ChronicleMap
+     */
+    public void putToMap(String mapName, String key, String value, MapConfig config) {
+        try {
+            ChronicleMap<String, String> map = getMap(mapName, config);
+            map.put(key, value);
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Error while putting data into ChronicleMap: " + mapName, e);
+        }
+    }
+
+    /**
+     * 添加数据到 Multimap
+     */
+    public void putToMultimap(String mapName, String key, String value, MapConfig config) {
+        lock.writeLock().lock();
+        try {
+            ChronicleMap<String, Set<String>> multimap = getMultimap(mapName, config);
+            multimap.compute(key, (k, v) -> {
+                if (v == null) {
+                    v = new HashSet<>();
+                }
+                v.add(value);
+                return v;
+            });
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Error while putting data into Multimap: " + mapName, e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * 获取普通 Map 的值
+     */
+    public String getFromMap(String mapName, String key, MapConfig config) {
+        try {
+            ChronicleMap<String, String> map = getMap(mapName, config);
+            return map.get(key);
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Error while retrieving data from ChronicleMap: " + mapName, e);
+            return null; // Handle the exception appropriately
+        }
+    }
+
+    /**
+     * 获取 Multimap 的值集合
+     */
+    public Set<String> getFromMultimap(String mapName, String key, MapConfig config) {
+        try {
+            ChronicleMap<String, Set<String>> multimap = getMultimap(mapName, config);
+            return multimap.get(key);
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Error while retrieving data from Multimap: " + mapName, e);
+            return null; // Handle the exception appropriately
+        }
+    }
+}
